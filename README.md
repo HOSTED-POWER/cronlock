@@ -1,210 +1,135 @@
 # cronlock
 
-<!-- badges/ -->
-[![Build Status](https://secure.travis-ci.org/kvz/cronlock.svg?branch=master)](http://travis-ci.org/kvz/cronlock "Check this project's build status on TravisCI")
-[![Gittip donate button](http://img.shields.io/gittip/kvz.svg)](https://www.gittip.com/kvz/ "Sponsor the development of cronlock via Gittip")
-[![Flattr donate button](http://img.shields.io/flattr/donate.png?color=yellow)](https://flattr.com/submit/auto?user_id=kvz&url=https://github.com/kvz/cronlock&title=cronlock&language=&tags=github&category=software "Sponsor the development of cronlock via Flattr")
-[![PayPayl donate button](http://img.shields.io/paypal/donate.png?color=yellow)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=kevin%40vanzonneveld%2enet&lc=NL&item_name=Open%20source%20donation%20to%20Kevin%20van%20Zonneveld&currency_code=USD&bn=PP-DonationsBF%3abtn_donate_SM%2egif%3aNonHosted "Sponsor the development of cronlock via Paypal")
-[![BitCoin donate button](http://img.shields.io/bitcoin/donate.png?color=yellow)](https://coinbase.com/checkouts/19BtCjLCboRgTAXiaEvnvkdoRyjd843Dg2 "Sponsor the development of cronlock via BitCoin")
-<!-- /badges -->
+Run one copy of a command at a time using a short, renewable Redis lease. This
+fork continues to accept `cronlock command [arguments...]` and the historical
+`CRONLOCK_*` configuration file. It replaces the original 2012 timestamp lock,
+which could suppress cron for `CRONLOCK_RELEASE` (48 hours in TurboStack) after
+the worker rebooted.
 
-## Install
-
-On most Linux & BSD machines, cronlock will install just by downloading it & making it executable.
-Here's the one-liner:
-
-```bash
-sudo curl -q -L https://raw.github.com/kvz/cronlock/master/cronlock -o /usr/bin/cronlock && sudo chmod +x $_
-```
-
-With [Redis](http://redis.io/) present on `localhost`, cronlock should now already work in basic form.
-Let's test by letting it execute a simple `pwd`:
-
-```bash
-CRONLOCK_HOST=localhost cronlock pwd
-```
-
-If this returns the current directory we're good to go. More examples below.
-
-## Introduction
-
-Uses a central [Redis](http://redis.io/) server to globally lock cronjobs across a distributed system.
-This can be usefull if you have 30 webservers that you deploy crontabs to (such as
-mailing your customers), but you don't want 30 cronjobs spawned.
-
-Of course you could also deploy your cronjobs to 1 box, but in volatile environments
-such as EC2 it can be helpful not to rely on 1 'throw away machine' for your scheduled tasks,
-and have 1 deploy-script for all your workers.
-
-Another common problem that cronlock will solve is overlap by a single server/cronjob.
-It happens a lot that developers underestimate how long a job will run.
-This can happen because the job waits on something, acts different under high load/volume, or enters an endless loop.
-
-In these cases you don't want the job to be fired again at the next cron-interval, making your problem twice as bad,
-some intervals later, there's a huge `ps auxf` with overlapping cronjobs, high server load, and eventually a crash.
-
-By settings locks, cronlock can also prevent the overlap in longer-than-expected-running cronjobs.
-
-## Design goals
-
- - Lightweight
- - As little dependencies as possible / No setup
- - Follows locking logic from [this Redis documentation](http://redis.io/commands/setnx)
- - Well tested & documented
+The original project is [kvz/cronlock](https://github.com/kvz/cronlock), by
+Kevin van Zonneveld and contributors. This fork remains MIT-licensed.
 
 ## Requirements
 
- - Bash (version 3.0 and above) with `/dev/tcp` enabled. Older Debian/Ubuntu systems disable `/dev/tcp`
- - `md5` or `md5sum`
- - A [Redis](http://redis.io/) server, or cluster of servers that is accessible by all cronlock machines
+- Python 3.9 or newer; no third-party Python packages or `redis-cli` are needed.
+- A reachable Redis server. Redis Sentinel and Redis Cluster redirects are
+  supported through the existing settings.
+- Bash only when loading an existing shell-style `cronlock.conf`. Treat that
+  file as trusted executable configuration and keep it writable only by an
+  administrator.
+- Linux `ip` (iproute2) only when `CRONLOCK_LOCAL_VIP` is set.
 
-## Options
+Use a reviewed release of this fork for deployment. Do not fetch a floating
+`master` branch into production; that can replace a tested executable during
+an unrelated provisioning run.
 
- - `CRONLOCK_CONFIG` location of config file. this is optional since all config can also be
- passed as environment variables. default: `<DIR>/cronlock.conf`, `/etc/cronlock.conf`
+## Basic use
 
-Using the `CRONLOCK_CONFIG` file or by exporting in your environment, you can set these variables
-to change the behavior of cronlock:
-
- - `CRONLOCK_HOST` the Redis hostname. default: `localhost`
- - `CRONLOCK_PORT` the Redis port. default: `6379`
- - `CRONLOCK_AUTH` the Redis auth password. default: Not present
- - `CRONLOCK_DB` the Redis database. default: `0`
- - `CRONLOCK_REDIS_TIMEOUT` the length of time we wait for a response from redis before we consider it in an errored state.
- This ensures that if the redis connection goes away that we don't wait forever waiting for a response. default: `30`
- - `CRONLOCK_GRACE` determines how many seconds a lock should at least persist.
- This is to make sure that if you have a very small job, and clocks aren't in sync, the same job
- on server2/3/4/5/6/etc (maybe even slightly behind in time) will just fire right after server1 releases the lock. default: `40` (I recommend using a grace of at least 30s)
- - `CRONLOCK_RELEASE` determines how long a lock can persist at most.
- Acts as a failsafe so there can be no locks that persist forever in case of failure. default is a day: `86400`
- - `CRONLOCK_RECONNECT_ATTEMPTS` the number of times we try to reconnect before erroring.
-  If the redis connection is closed, we will attempt to reconnect to redis upto this amount of times. default: `5`
- - `CRONLOCK_RECONNECT_BACKOFF` the lenght of time to increase the wait between reconnects.
-  Acts as a failsafe to allow redis to be started before we try to reconnect. Set to 0 to retry the connection immediately. default: `5`
- - `CRONLOCK_KEY` a unique key for this command in the global Redis server. default: a hash of cronlock's arguments
- - `CRONLOCK_PREFIX` Redis key prefix used by all keys. default: `cronlock`
- - `CRONLOCK_VERBOSE` set to `yes` to print debug messages. default: `no`
- - `CRONLOCK_NTPDATE` set to `yes` update the server's clock againt `pool.ntp.org` before execution. default: `no`
- - `CRONLOCK_TIMEOUT` how long the command can run before it gets issues a `kill -9`. default: `0`; no timeout
-
-## Redis Cluster Support
-
-Cronlock has support for Redis Cluster (http://redis.io/topics/cluster-spec) introduced in Redis 3.0. 
-
-Cronlock acts as a relatively "dumb" cluster client - it will react to MOVED and ASK commands and retry the request to the node given back in the response but it does not attempt to record the slot to node relationship for future use.
-
-Cronlock supports the configuration of only one `CRONLOCK_HOST` and `CRONLOCK_PORT`. Cronlock will always connect to the configured host and port and issue the initial REDIS command with the calculated MD5 key. If the Redis node returns ASK or MOVED, Cronlock will disconnect and connect to the given host and port in the ASK or MOVED respoonse. The new Redis host is used for the remaining duration of the execution of Cronlock (or until another ASK or MOVED command is returned) - Cronlock will connect to the originally configured `CRONLOCK_HOST` and `CRONLOCK_PORT` for the next execution.
-
-Given the support of only one `CRONLOCK_HOST` and `CRONLOCK_PORT` it is recommended that each server running cronlock is configured to initially connect a different master in the Redis Cluster. Thus if one Redis server goes down the instances of Cronlock configured to connect to the other master nodes will continue to operate. 
-
-This is easily done if the Redis Cluster is on the same servers as Cronlock - as `CRONLOCK_HOST` can be set to 127.0.0.1 - each copy of Cronlock will therefore initially connect to its local master node - before reconnecting to other alive Redis nodes.
-
-Aside from configuring appropriate values for `CRONLOCK_HOST` and `CRONLOCK_PORT` for the systems running Cronlock - no additional configuration is required for Redis Cluster support.
-
-
-## Examples
-
-### Single box
-
-```bash
-crontab -e
-* * * * * cronlock ls -al
+```sh
+CRONLOCK_HOST=127.0.0.1 cronlock /usr/bin/php /srv/shop/bin/magento cron:run
 ```
 
-In this configuration, `ls -al` will be launched every minute. If the previous
-`ls -al` has not finished yet, another one is not started.
-This works on 1 server, as the default `CRONLOCK_HOST` of `localhost` is used.
+Two invocations with the same command and arguments derive the same lock key.
+Set `CRONLOCK_KEY` explicitly if the command arguments differ between hosts or
+if several commands must share one lock. A contender exits with code `200`
+without starting the command. A successful owner passes through the command's
+exit code.
 
-In this setup, cronlock works much like [Tim Kay](http://timkay.com/)'s [solo](https://github.com/timkay/solo),
-except cronlock requires [Redis](http://redis.io/), so I recommend using Tim Kay's solution here.
+The key format is deliberately unchanged from the original tool: MD5 of the
+space-joined argument list plus a final newline, prefixed with
+`CRONLOCK_PREFIX`. This avoids a duplicate-run window during a rolling upgrade.
+An old numeric lock with no Redis TTL is given a TTL until its original
+timestamp and is reclaimed atomically after that deadline. An old lock whose
+timestamp is still 48 hours in the future cannot safely be discarded early;
+inspect its owner before any manual removal.
 
-### Distributed
+## Optional VIP owner
 
-```bash
-echo '0 8 * * * CRONLOCK_HOST=redis.mydomain.com cronlock /var/www/mail_customers.sh' | crontab
+Set `CRONLOCK_LOCAL_VIP` in `/etc/cronlock.conf` on both peers, or only for the
+specific cron entry. When it is unset, no VIP check takes place. When set, a
+non-owner skips before contacting Redis; the owner runs the job under the
+normal Redis lease. The VIP is rechecked while the command runs, and a loss of
+ownership terminates its process group.
+
+```sh
+# /etc/cronlock.conf on both members of one HASET cluster
+CRONLOCK_HOST="10.100.30.31"
+CRONLOCK_PORT=6378
+CRONLOCK_LOCAL_VIP="10.100.30.20"
 ```
 
-In this configuration, a central Redis server is used to track the locking for
-`/var/www/mail_customers.sh`. So you see that throughout a cluster of 100 servers,
-just one instance of `/var/www/mail_customers.sh` is ran every morning. No less, no more.
-
-As long as your Redis server and at least 1 volatile worker is alive, this happens.
-
-### Distributed using a config file
-
-To avoid messy crontabs, you can use a config file for shared config instead.
-Unless `CRONLOCK_CONFIG` is set, cronlock will look in `./cronlock.conf`, then
-in `/etc/cronlock.conf`.
-
-Example:
-```bash
-cat << EOF > /etc/cronlock.conf
-CRONLOCK_HOST="redis.mydomain.com"
-CRONLOCK_GRACE=50
-CRONLOCK_PREFIX="mycompany.cronlocks."
-CRONLOCK_NTPDATE="yes"
-EOF
-
-crontab -e
-* * * * * cronlock /var/www/mail_customers.sh # will use config from /etc/cronlock.conf
+```cron
+* * * * * cronlock /usr/bin/php /var/www/prod/magento2/current/bin/magento cron:run >> /var/www/prod/magento2/shared/var/log/crontab.log 2>&1
 ```
 
-### Lock commands even though they have different arguments
+The VIP mode makes a Pacemaker-owned address choose the *starting node*. It is
+not a distributed Magento lock provider. Detached application workers may
+outlive the parent command or leave its process group, so a planned VIP handoff
+still needs an application drain. If the VIP is absent everywhere, no node
+starts new work. Monitor both the scheduler and the application's job backlog.
 
-By default cronlock uses your command and its arguments to make a unique identifier
-by which the global lock is acquired. However if you want to run: `ls -al` or `ls -a`,
-but just 1 instance of either, you'll want to provide your own key:
+Do not set a global `CRONLOCK_LOCAL_VIP` on a host that also has unrelated
+cronlock jobs unless those jobs should follow the same VIP. Per-job settings
+can be supplied with `CRONLOCK_CONFIG=/path/to/job.conf`.
 
-```bash
-crontab -e
-# One of two will be executed because they share the same KEY
-* * * * * CRONLOCK_KEY="ls" cronlock ls -al
-* * * * * CRONLOCK_KEY="ls" cronlock ls -a
-```
+## Crash-safe lease
 
-### Per application
+Acquisition uses Redis `SET key token NX PX lease_ms`. The token is random and
+the Redis key has a TTL immediately. While the command runs, cronlock renews
+the TTL only if it still owns the token. On normal completion it atomically
+checks ownership and either deletes its key or retains it for the remaining
+`CRONLOCK_GRACE` period. A killed owner cannot leave a key without a TTL; its
+successor can try again after at most the remaining lease time.
 
-If you use the same script and Redis server for multiple applications, an unwanted lock could deny app2 its script.
-You could make up your own unique `CRONLOCK_KEY` to circumvent, but it's probably
-better to use the `CRONLOCK_PREFIX` for that:
+The lease defaults to 90 seconds and renews roughly every 30 seconds. Use a
+lease of at least 30 seconds in production so network retries and process
+shutdown have time to complete before another worker can acquire the key. A Redis
+outage or loss of token ownership stops the managed process rather than letting
+it run indefinitely without a lock. `CRONLOCK_RELEASE` is deprecated and is
+**not** the crash-recovery deadline in this version. Shortening an unrenewed
+release timer is not a safe replacement for renewal: a long-running job could
+then overlap its successor.
 
-```bash
-crontab -e
-* * * * * CRONLOCK_PREFIX="mylocks.app1." cronlock /var/www/mail_customers.sh
-```
+These are cooperative leases, not a promise of exactly-once execution. Redis
+asynchronous failover can lose a recently written key; a process killed with
+`SIGKILL` can leave its child running briefly; and a program may create
+detached work outside the managed process group. Duplicate-sensitive jobs
+still need application-level idempotency or stronger fencing/coordination.
 
-```bash
-crontab -e
-* * * * * CRONLOCK_PREFIX="mylocks.app2." cronlock /var/www/mail_customers.sh
-```
+## Configuration
 
-Now both /var/www/mail_customers.sh will run, because they have a different application in their prefixes.
+Configuration is loaded from `CRONLOCK_CONFIG`, or from `cronlock.conf` beside
+the executable, or from `/etc/cronlock.conf`, in that order. As in the original
+tool, assignments in a config file override same-named environment variables.
 
-## Exit codes
+| Setting | Purpose | Default |
+| --- | --- | --- |
+| `CRONLOCK_HOST`, `CRONLOCK_PORT`, `CRONLOCK_DB` | Redis connection | `localhost`, `6379`, `0` |
+| `CRONLOCK_AUTH`, `CRONLOCK_USER` | Redis password and optional ACL user | unset |
+| `CRONLOCK_KEY`, `CRONLOCK_PREFIX` | Shared lock identity | command hash, `cronlock.` |
+| `CRONLOCK_LEASE` | Renewable lease seconds | `90` |
+| `CRONLOCK_GRACE` | Minimum interval since acquisition before next owner | `40` seconds |
+| `CRONLOCK_LOCAL_VIP` | Optional IP that must be local to run | unset |
+| `CRONLOCK_TIMEOUT` | Maximum command run time; `0` disables | `0` |
+| `CRONLOCK_REDIS_TIMEOUT` | Socket timeout seconds | `5` |
+| `CRONLOCK_RECONNECT_ATTEMPTS`, `CRONLOCK_RECONNECT_BACKOFF` | Redis retry count and step seconds | `5`, `1` |
+| `CRONLOCK_USE_SENTINEL`, `CRONLOCK_SENTINEL_MASTER`, `CRONLOCK_SENTINEL_HOST`, `CRONLOCK_SENTINEL_PORT` | Optional Sentinel lookup | `no`, `mymaster`, `localhost`, `26379` |
+| `CRONLOCK_SENTINEL_AUTH` | Optional Sentinel password | unset |
+| `CRONLOCK_VERBOSE` | Diagnostic messages | `no` |
 
- - = `200` Success (delete succeeded or lock not acquired, but normal execution)
- - = `201` Failure (cronlock error)
- - = `202` Failure (cronlock timeout)
- - < `200` Success (acquired lock, executed your command), passes the exit code of your command
+`CRONLOCK_NTPDATE` is no longer used: Redis TTLs do not depend on synchronized
+client clocks. `CRONLOCK_RESET=yes` now fails instead of unconditionally
+deleting another live owner's key. An administrator can inspect and remove a
+known-stale key through Redis after verifying no owner remains.
 
-## Versioning
+Exit codes: `200` means skipped (VIP absent or lock held); `201` means
+configuration, Redis, or lease-safety failure; `202` means command timeout.
+Otherwise the wrapped command's exit code is returned. As in the original
+tool, child exit codes in the reserved 200–202 range are ambiguous.
 
-This project implements the Semantic Versioning guidelines.
+## Testing
 
-Releases will be numbered with the following format:
-
-`<major>.<minor>.<patch>`
-
-And constructed with the following guidelines:
-
-* Breaking backward compatibility bumps the major (and resets the minor and patch)
-* New additions without breaking backward compatibility bumps the minor (and resets the patch)
-* Bug fixes and misc changes bumps the patch
-
-
-For more information on SemVer, please visit [http://semver.org](http://semver.org).
-
-## License
-
-Copyright (c) 2013 Kevin van Zonneveld, [http://kvz.io](http://kvz.io)  
-Licensed under MIT: [http://kvz.io/licenses/LICENSE-MIT](http://kvz.io/licenses/LICENSE-MIT)
+`make test` or `./test` starts a disposable Redis 7 container when Docker is
+available. To use an existing disposable Redis instance, set
+`CRONLOCK_TEST_PORT` (and optionally `CRONLOCK_TEST_HOST`) first. Never point
+the tests at a production Redis instance.
