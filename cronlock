@@ -1,517 +1,309 @@
-#!/usr/bin/env python3
-"""Run one copy of a command under a renewable Redis lease.
+#!/usr/bin/env bash
+# Run one copy of a command with a short, renewable Redis lease.
+# The historical cronlock command line, config file, and lock key are preserved.
 
-The command-line and CRONLOCK_* settings intentionally match the historical
-shell tool. Redis is accessed through RESP directly, so no Python package or
-redis-cli installation is required.
-"""
+export LC_ALL=C
 
-from __future__ import annotations
+die() {
+  printf 'cronlock: %s\n' "$*" >&2
+  exit 201
+}
 
-import hashlib
-import ipaddress
-import os
-import secrets
-import shutil
-import signal
-import socket
-import subprocess
-import sys
-import threading
-import time
-from pathlib import Path
+info() {
+  if [[ ${CRONLOCK_VERBOSE:-no} == yes ]]; then
+    printf 'cronlock: %s\n' "$*" >&2
+  fi
+}
 
+seconds_to_ms() {
+  [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+  awk -v value="$1" -v minimum="$2" 'BEGIN {
+    if (value < minimum) exit 1
+    printf "%.0f", value * 1000
+  }'
+}
 
-SKIPPED = 200
-ERROR = 201
-TIMED_OUT = 202
+ms_to_seconds() {
+  printf '%d.%03d' "$(( $1 / 1000 ))" "$(( $1 % 1000 ))"
+}
 
-RENEW_SCRIPT = (
-    "if redis.call('GET', KEYS[1]) == ARGV[1] then "
-    "return redis.call('PEXPIRE', KEYS[1], ARGV[2]) else return 0 end"
-)
-FINISH_SCRIPT = (
-    "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end "
-    "if tonumber(ARGV[2]) > 0 then "
-    "return redis.call('PEXPIRE', KEYS[1], ARGV[2]) "
-    "else return redis.call('DEL', KEYS[1]) end"
-)
-LEGACY_SCRIPT = (
-    "local value = redis.call('GET', KEYS[1]); "
-    "if not value or #value > 12 or not string.match(value, '^%d+$') then return 0 end; "
-    "local deadline = tonumber(value); "
-    "if not deadline then return 0 end; "
-    "local now = tonumber(redis.call('TIME')[1]); "
-    "if deadline <= now then "
-    "redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2]); return 1 end; "
-    "if redis.call('PTTL', KEYS[1]) < 0 then "
-    "redis.call('PEXPIRE', KEYS[1], math.max(1, math.ceil((deadline - now) * 1000))) end; "
-    "return 0"
-)
+script_dir=${BASH_SOURCE[0]%/*}
+[[ $script_dir == "${BASH_SOURCE[0]}" ]] && script_dir=.
+if [[ -n ${CRONLOCK_CONFIG:-} ]]; then
+  [[ -f $CRONLOCK_CONFIG ]] || die "config file does not exist: $CRONLOCK_CONFIG"
+elif [[ -f $script_dir/cronlock.conf ]]; then
+  CRONLOCK_CONFIG=$script_dir/cronlock.conf
+elif [[ -f /etc/cronlock.conf ]]; then
+  CRONLOCK_CONFIG=/etc/cronlock.conf
+fi
+if [[ -n ${CRONLOCK_CONFIG:-} ]]; then
+  # The config has always been trusted executable Bash, loaded after the env.
+  # shellcheck source=/dev/null
+  source "$CRONLOCK_CONFIG" || die "cannot load config file: $CRONLOCK_CONFIG"
+fi
 
+: "${CRONLOCK_HOST:=localhost}"
+: "${CRONLOCK_PORT:=6379}"
+: "${CRONLOCK_DB:=0}"
+: "${CRONLOCK_GRACE:=40}"
+: "${CRONLOCK_LEASE:=90}"
+: "${CRONLOCK_TIMEOUT:=0}"
+: "${CRONLOCK_REDIS_TIMEOUT:=5}"
+: "${CRONLOCK_RECONNECT_ATTEMPTS:=5}"
+: "${CRONLOCK_RECONNECT_BACKOFF:=1}"
+: "${CRONLOCK_PREFIX:=cronlock.}"
+: "${CRONLOCK_USE_SENTINEL:=no}"
+: "${CRONLOCK_SENTINEL_HOST:=localhost}"
+: "${CRONLOCK_SENTINEL_PORT:=26379}"
+: "${CRONLOCK_SENTINEL_MASTER:=mymaster}"
 
-class CronlockError(Exception):
-    """A failed precondition or a Redis operation that must stop the job."""
+[[ $# -gt 0 ]] || die 'usage: cronlock command [argument ...]'
+[[ ${CRONLOCK_RESET:-no} != yes ]] || die 'CRONLOCK_RESET is unsafe for live leases and is no longer supported'
 
+local_vip_owner() {
+  local address=${CRONLOCK_LOCAL_VIP:-} family=-4 prefix=32 ip_command output
+  [[ -n $address ]] || return 0
+  if [[ $address == *:* ]]; then
+    family=-6
+    prefix=128
+  fi
+  ip_command=$(command -v ip 2>/dev/null) || ip_command=''
+  [[ -n $ip_command ]] || {
+    [[ -x /usr/sbin/ip ]] && ip_command=/usr/sbin/ip
+    [[ -x /sbin/ip && -z $ip_command ]] && ip_command=/sbin/ip
+  }
+  [[ -n $ip_command ]] || die 'iproute2 is required for CRONLOCK_LOCAL_VIP'
+  output=$("$ip_command" -o "$family" addr show to "$address/$prefix" 2>/dev/null) || die 'local IP address check failed'
+  [[ -n $output ]]
+}
 
-class RedisReplyError(CronlockError):
-    """An error reply from Redis, including cluster redirection replies."""
+# A non-owner does not need Redis at all. Recheck after acquisition so a VIP
+# handoff between those two points cannot start a new job on the old owner.
+if ! local_vip_owner; then
+  info 'local VIP is absent; skipping command'
+  exit 200
+fi
 
+redis_cli=$(command -v redis-cli 2>/dev/null) || die 'redis-cli is required'
+command -v timeout >/dev/null 2>&1 || die 'GNU timeout is required'
+command -v setsid >/dev/null 2>&1 || die 'setsid is required'
+command -v md5sum >/dev/null 2>&1 || die 'md5sum is required'
+command -v od >/dev/null 2>&1 || die 'od is required'
+command -v "$1" >/dev/null 2>&1 || die "cannot start command: $1"
 
-def load_settings() -> dict[str, str]:
-    """Source the existing Bash-style config without changing its precedence.
+lease_ms=$(seconds_to_ms "$CRONLOCK_LEASE" 1) || die 'CRONLOCK_LEASE must be at least one second'
+grace_ms=$(seconds_to_ms "$CRONLOCK_GRACE" 0) || die 'CRONLOCK_GRACE must be nonnegative'
+run_limit_ms=$(seconds_to_ms "$CRONLOCK_TIMEOUT" 0) || die 'CRONLOCK_TIMEOUT must be nonnegative'
+seconds_to_ms "$CRONLOCK_REDIS_TIMEOUT" 0.1 >/dev/null || die 'CRONLOCK_REDIS_TIMEOUT must be positive'
+backoff_ms=$(seconds_to_ms "$CRONLOCK_RECONNECT_BACKOFF" 0) || die 'CRONLOCK_RECONNECT_BACKOFF must be nonnegative'
+[[ $CRONLOCK_RECONNECT_ATTEMPTS =~ ^[0-9]+$ ]] || die 'CRONLOCK_RECONNECT_ATTEMPTS must be an integer'
+[[ $CRONLOCK_DB =~ ^[0-9]+$ && $CRONLOCK_PORT =~ ^[0-9]+$ ]] || die 'Redis port and database must be integers'
+[[ -z ${CRONLOCK_USER:-} || -n ${CRONLOCK_AUTH:-} ]] || die 'CRONLOCK_USER requires CRONLOCK_AUTH'
 
-    The old tool sourced its config after reading the environment. Bash is used
-    only for that compatibility step; Redis replies are never interpreted by a
-    shell. Config files are trusted executable files, as they were before.
-    """
-    settings = dict(os.environ)
-    requested = settings.get("CRONLOCK_CONFIG", "")
-    candidates = (
-        [Path(requested)]
-        if requested
-        else [
-            Path(__file__).resolve().parent / "cronlock.conf",
-            Path("/etc/cronlock.conf"),
-        ]
-    )
-    config = next((path for path in candidates if path.exists()), None)
-    if requested and config is None:
-        raise CronlockError(f"config file does not exist: {requested}")
-    if config is None:
-        return settings
+redis_once() {
+  local max_time=$1 host=$CRONLOCK_HOST port=$CRONLOCK_PORT sentinel_reply reply line
+  shift
+  if [[ $CRONLOCK_USE_SENTINEL == yes ]]; then
+    if [[ -n ${CRONLOCK_SENTINEL_AUTH:-} ]]; then
+      export REDISCLI_AUTH=$CRONLOCK_SENTINEL_AUTH
+    else
+      unset REDISCLI_AUTH
+    fi
+    sentinel_reply=$(timeout "$max_time" \
+      "$redis_cli" --raw -h "$CRONLOCK_SENTINEL_HOST" -p "$CRONLOCK_SENTINEL_PORT" \
+      SENTINEL get-master-addr-by-name "$CRONLOCK_SENTINEL_MASTER" 2>&1) || return 1
+    [[ $sentinel_reply != *'AUTH failed'* ]] || return 1
+    local -a address
+    mapfile -t address <<< "$sentinel_reply"
+    [[ ${#address[@]} -eq 2 && ${address[1]} =~ ^[0-9]+$ ]] || return 1
+    host=${address[0]}
+    port=${address[1]}
+  fi
+  local -a options=(--raw -c -h "$host" -p "$port" -n "$CRONLOCK_DB")
+  [[ -n ${CRONLOCK_USER:-} ]] && options+=(--user "$CRONLOCK_USER")
+  if [[ -n ${CRONLOCK_AUTH:-} ]]; then
+    export REDISCLI_AUTH=$CRONLOCK_AUTH
+  else
+    unset REDISCLI_AUTH
+  fi
+  reply=$(timeout "$max_time" "$redis_cli" "${options[@]}" "$@" 2>&1) || return 1
+  # redis-cli may execute a command as the unauthenticated default user even
+  # after a configured AUTH fails. Never treat that command's reply as success.
+  [[ $reply != *'AUTH failed'* && $reply != *WRONGPASS* && $reply != *NOAUTH* && $reply != *' failed: '* ]] || return 1
+  while IFS= read -r line; do
+    [[ $line == '-> Redirected to slot '* ]] && continue
+    printf '%s\n' "$line"
+  done <<< "$reply"
+}
 
-    # set -a exports assignments that an ordinary Bash `source` would keep
-    # local. env -0 preserves spaces/newlines inside values without eval.
-    try:
-        result = subprocess.run(
-            [
-                "bash",
-                "-c",
-                'set -a; source "$1" || exit; env -0',
-                "cronlock",
-                str(config),
-            ],
-            env=settings,
-            capture_output=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise CronlockError(f"cannot load config file {config}: {exc}") from exc
-    if result.returncode:
-        raise CronlockError(f"cannot load config file: {config}")
-    for item in result.stdout.split(b"\0"):
-        name, separator, value = item.partition(b"=")
-        if separator and name.startswith(b"CRONLOCK_"):
-            settings[name.decode()] = value.decode(errors="surrogateescape")
-    return settings
+redis_call() {
+  local attempt reply delay_ms
+  for ((attempt = 0; attempt <= CRONLOCK_RECONNECT_ATTEMPTS; attempt++)); do
+    if reply=$(redis_once "$CRONLOCK_REDIS_TIMEOUT" "$@"); then
+      printf '%s' "$reply"
+      return 0
+    fi
+    (( attempt < CRONLOCK_RECONNECT_ATTEMPTS )) || break
+    delay_ms=$(( backoff_ms * attempt ))
+    sleep "$(ms_to_seconds "$delay_ms")"
+  done
+  return 1
+}
 
+# redis-cli can continue with the command in database zero after SELECT fails.
+# Check a non-default database before issuing any mutating lease command.
+if [[ $CRONLOCK_DB != 0 ]]; then
+  [[ $(redis_call PING) == PONG ]] || die 'cannot select Redis database'
+fi
 
-def number(
-    settings: dict[str, str], name: str, default: float, *, minimum: float = 0
-) -> float:
-    try:
-        value = float(settings.get(name, str(default)))
-    except ValueError as exc:
-        raise CronlockError(f"{name} must be a number") from exc
-    if not minimum <= value < float("inf"):
-        raise CronlockError(f"{name} must be at least {minimum}")
-    return value
+# The random token prevents an expired owner from renewing or releasing its
+# successor's lease. Lua keeps each token check and write atomic.
+renew_lua="if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) else return 0 end"
+finish_lua="if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+  if tonumber(ARGV[2]) > 0 then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
+  return redis.call('DEL', KEYS[1])"
+legacy_lua="local value = redis.call('GET', KEYS[1])
+  if not value or #value > 12 or not string.match(value, '^%d+$') then return 0 end
+  local deadline = tonumber(value)
+  if not deadline then return 0 end
+  local now = tonumber(redis.call('TIME')[1])
+  if deadline <= now then
+    redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2]); return 1
+  end
+  if redis.call('PTTL', KEYS[1]) < 0 then
+    redis.call('PEXPIRE', KEYS[1], math.max(1, math.ceil((deadline - now) * 1000)))
+  end
+  return 0"
 
+key_name=${CRONLOCK_KEY:-}
+if [[ -z $key_name ]]; then
+  key_name=$(printf '%s\n' "$*" | md5sum)
+  key_name=${key_name%% *}
+fi
+key=${CRONLOCK_PREFIX}${key_name}
+token=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
+[[ ${#token} -eq 48 ]] || die 'could not generate a Redis lease token'
 
-def integer(
-    settings: dict[str, str],
-    name: str,
-    default: int,
-    *,
-    minimum: int = 0,
-    maximum: int | None = None,
-) -> int:
-    try:
-        value = int(settings.get(name, str(default)))
-    except ValueError as exc:
-        raise CronlockError(f"{name} must be an integer") from exc
-    if value < minimum or (maximum is not None and value > maximum):
-        raise CronlockError(f"{name} is outside its allowed range")
-    return value
+owner_pid=$$
+child_pid=0
+monitor_pid=0
+timer_pid=0
+stop_reason=''
 
+stop_job() {
+  [[ -n $stop_reason ]] || stop_reason=$1
+  if (( child_pid > 0 )); then
+    # setsid may not have created the new process group yet at startup.
+    kill -TERM -- "-$child_pid" 2>/dev/null || kill -TERM "$child_pid" 2>/dev/null || true
+  fi
+}
 
-def verbose(settings: dict[str, str], message: str) -> None:
-    if settings.get("CRONLOCK_VERBOSE", "no") == "yes":
-        print(message, file=sys.stderr, flush=True)
+trap 'stop_job term' TERM
+trap 'stop_job int' INT
+trap 'stop_job lease' USR1
+trap 'stop_job timeout' USR2
 
+acquired=$(redis_call SET "$key" "$token" NX PX "$lease_ms") || die 'cannot acquire Redis lease'
+if [[ -z $acquired ]]; then
+  acquired=$(redis_call EVAL "$legacy_lua" 1 "$key" "$token" "$lease_ms") || die 'cannot inspect an existing Redis lock'
+  [[ $acquired == 1 || $acquired == 0 ]] || die 'Redis rejected legacy lock migration'
+  if [[ $acquired == 0 ]]; then
+    info "$key is already held; skipping command"
+    exit 200
+  fi
+elif [[ $acquired != OK ]]; then
+  die "Redis rejected lease acquisition: $acquired"
+fi
 
-def local_vip_owner(settings: dict[str, str]) -> bool:
-    address = settings.get("CRONLOCK_LOCAL_VIP", "")
-    if not address:
-        return True
-    try:
-        vip = ipaddress.ip_address(address)
-    except ValueError as exc:
-        raise CronlockError("CRONLOCK_LOCAL_VIP must be one IP address") from exc
-    family = "-4" if vip.version == 4 else "-6"
-    prefix = 32 if vip.version == 4 else 128
-    # Cron commonly omits /usr/sbin from PATH for unprivileged users.
-    ip_command = shutil.which("ip") or next(
-        (path for path in ("/usr/sbin/ip", "/sbin/ip") if Path(path).is_file()),
-        None,
-    )
-    if ip_command is None:
-        raise CronlockError("iproute2 is required for CRONLOCK_LOCAL_VIP")
-    try:
-        result = subprocess.run(
-            [ip_command, "-o", family, "addr", "show", "to", f"{vip}/{prefix}"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise CronlockError("cannot inspect local IP addresses") from exc
-    if result.returncode:
-        raise CronlockError("local IP address check failed")
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        for position, field in enumerate(fields[:-1]):
-            if field in {"inet", "inet6"}:
-                try:
-                    if ipaddress.ip_interface(fields[position + 1]).ip == vip:
-                        return True
-                except ValueError:
-                    pass
-    return False
+release_lease() {
+  local remaining_ms=$1 result
+  result=$(redis_call EVAL "$finish_lua" 1 "$key" "$token" "$remaining_ms") || return 1
+  [[ $result == 1 ]]
+}
 
+if [[ -n $stop_reason ]]; then
+  release_lease 0 || die 'Redis lease could not be released after interruption'
+  [[ $stop_reason == int ]] && exit 130
+  exit 143
+fi
 
-def _wire(*arguments: object) -> bytes:
-    parts = [f"*{len(arguments)}\r\n".encode()]
-    for argument in arguments:
-        value = str(argument).encode()
-        parts.extend((f"${len(value)}\r\n".encode(), value, b"\r\n"))
-    return b"".join(parts)
+if ! local_vip_owner; then
+  release_lease 0 || die 'local VIP moved and Redis lease could not be released'
+  die 'local VIP disappeared before command startup'
+fi
 
+started_ms=$(date +%s%3N)
+monitor_lease() {
+  local interval_ms=$(( lease_ms / 3 )) renew_after_ms last_success_ms now_ms result
+  (( interval_ms < 200 )) && interval_ms=200
+  (( interval_ms > 1000 )) && interval_ms=1000
+  local retry_timeout_ms=$(( lease_ms / 4 ))
+  local configured_timeout_ms
+  configured_timeout_ms=$(seconds_to_ms "$CRONLOCK_REDIS_TIMEOUT" 0.1)
+  (( retry_timeout_ms > configured_timeout_ms )) && retry_timeout_ms=$configured_timeout_ms
+  last_success_ms=$(date +%s%3N)
+  renew_after_ms=$(( last_success_ms + lease_ms / 3 ))
+  while sleep "$(ms_to_seconds "$interval_ms")"; do
+    kill -0 "$owner_pid" 2>/dev/null || return 0
+    now_ms=$(date +%s%3N)
+    (( now_ms >= renew_after_ms )) || continue
+    if result=$(redis_once "$(ms_to_seconds "$retry_timeout_ms")" EVAL "$renew_lua" 1 "$key" "$token" "$lease_ms"); then
+      if [[ $result == 1 ]]; then
+        last_success_ms=$(date +%s%3N)
+        renew_after_ms=$(( last_success_ms + lease_ms / 3 ))
+        continue
+      fi
+      kill -USR1 "$owner_pid" 2>/dev/null || true
+      return 0
+    fi
+    now_ms=$(date +%s%3N)
+    if (( now_ms - last_success_ms >= lease_ms / 2 )); then
+      kill -USR1 "$owner_pid" 2>/dev/null || true
+      return 0
+    fi
+    renew_after_ms=$(( now_ms + interval_ms ))
+  done
+}
 
-def _read_reply(stream):
-    kind = stream.read(1)
-    line = stream.readline(1024 * 1024)
-    if not kind or not line.endswith(b"\r\n"):
-        raise CronlockError("Redis closed the connection mid-reply")
-    body = line[:-2]
-    if kind == b"+":
-        return body.decode()
-    if kind == b"-":
-        raise RedisReplyError(body.decode(errors="replace"))
-    if kind == b":":
-        return int(body)
-    if kind == b"$":
-        length = int(body)
-        if length == -1:
-            return None
-        if length < 0 or length > 16 * 1024 * 1024:
-            raise CronlockError("invalid Redis bulk reply length")
-        value = stream.read(length + 2)
-        if len(value) != length + 2 or not value.endswith(b"\r\n"):
-            raise CronlockError("Redis sent a truncated bulk reply")
-        return value[:-2].decode()
-    if kind == b"*":
-        length = int(body)
-        if length == -1:
-            return None
-        if length < 0 or length > 1024:
-            raise CronlockError("invalid Redis array reply length")
-        return [_read_reply(stream) for _ in range(length)]
-    raise CronlockError("unsupported Redis reply type")
+setsid -- "$@" &
+child_pid=$!
+[[ -z $stop_reason ]] || stop_job "$stop_reason"
+monitor_lease &
+monitor_pid=$!
+if (( run_limit_ms > 0 )); then
+  (sleep "$CRONLOCK_TIMEOUT"; kill -USR2 "$owner_pid" 2>/dev/null || true) &
+  timer_pid=$!
+fi
 
+wait "$child_pid"
+command_status=$?
+if [[ -n $stop_reason ]]; then
+  shutdown_ms=$(( lease_ms / 4 ))
+  (( shutdown_ms > 5000 )) && shutdown_ms=5000
+  if kill -0 -- "-$child_pid" 2>/dev/null; then
+    sleep "$(ms_to_seconds "$shutdown_ms")"
+    kill -KILL -- "-$child_pid" 2>/dev/null || true
+  fi
+  wait "$child_pid" 2>/dev/null || true
+fi
 
-def _transact(sock: socket.socket, stream, *arguments: object):
-    sock.sendall(_wire(*arguments))
-    return _read_reply(stream)
+kill "$monitor_pid" 2>/dev/null || true
+wait "$monitor_pid" 2>/dev/null || true
+if (( timer_pid > 0 )); then
+  kill "$timer_pid" 2>/dev/null || true
+  wait "$timer_pid" 2>/dev/null || true
+fi
+trap - TERM INT USR1 USR2
 
+case $stop_reason in
+  lease) command_status=201 ;;
+  timeout) command_status=202 ;;
+  term) command_status=143 ;;
+  int) command_status=130 ;;
+esac
 
-class RedisClient:
-    """One-command Redis client with authentication and optional redirects."""
-
-    def __init__(
-        self,
-        settings: dict[str, str],
-        *,
-        timeout: float | None = None,
-        attempts: int | None = None,
-    ):
-        self.settings = settings
-        self.timeout = timeout or number(
-            settings, "CRONLOCK_REDIS_TIMEOUT", 5, minimum=0.1
-        )
-        self.host = settings.get("CRONLOCK_HOST", "localhost")
-        self.port = integer(settings, "CRONLOCK_PORT", 6379, minimum=1, maximum=65535)
-        self.database = integer(settings, "CRONLOCK_DB", 0)
-        self.attempts = (
-            integer(settings, "CRONLOCK_RECONNECT_ATTEMPTS", 5, maximum=100)
-            if attempts is None
-            else attempts
-        )
-        self.backoff = number(settings, "CRONLOCK_RECONNECT_BACKOFF", 1)
-
-    def _master_address(self) -> tuple[str, int]:
-        if self.settings.get("CRONLOCK_USE_SENTINEL", "no") != "yes":
-            return self.host, self.port
-        host = self.settings.get("CRONLOCK_SENTINEL_HOST", "localhost")
-        port = integer(
-            self.settings, "CRONLOCK_SENTINEL_PORT", 26379, minimum=1, maximum=65535
-        )
-        master = self.settings.get("CRONLOCK_SENTINEL_MASTER", "mymaster")
-        with socket.create_connection((host, port), self.timeout) as sock:
-            sock.settimeout(self.timeout)
-            with sock.makefile("rb") as stream:
-                auth = self.settings.get("CRONLOCK_SENTINEL_AUTH", "")
-                if auth:
-                    _transact(sock, stream, "AUTH", auth)
-                result = _transact(
-                    sock, stream, "SENTINEL", "get-master-addr-by-name", master
-                )
-        if not isinstance(result, list) or len(result) != 2:
-            raise CronlockError(f"Sentinel has no master named {master}")
-        return str(result[0]), int(result[1])
-
-    def _once(
-        self,
-        host: str,
-        port: int,
-        arguments: tuple[object, ...],
-        *,
-        asking: bool = False,
-    ):
-        with socket.create_connection((host, port), self.timeout) as sock:
-            sock.settimeout(self.timeout)
-            with sock.makefile("rb") as stream:
-                auth = self.settings.get("CRONLOCK_AUTH", "")
-                if auth:
-                    user = self.settings.get("CRONLOCK_USER", "")
-                    if user:
-                        _transact(sock, stream, "AUTH", user, auth)
-                    else:
-                        _transact(sock, stream, "AUTH", auth)
-                if self.database:
-                    _transact(sock, stream, "SELECT", self.database)
-                if asking:
-                    _transact(sock, stream, "ASKING")
-                return _transact(sock, stream, *arguments)
-
-    def execute(self, *arguments: object):
-        last_error = None
-        for attempt in range(self.attempts + 1):
-            try:
-                host, port = self._master_address()
-                for _ in range(6):
-                    try:
-                        return self._once(host, port, arguments)
-                    except RedisReplyError as exc:
-                        parts = str(exc).split()
-                        if len(parts) != 3 or parts[0] not in {"MOVED", "ASK"}:
-                            raise
-                        host, separator, target_port = parts[2].rpartition(":")
-                        if not separator:
-                            raise
-                        host = host.strip("[]")
-                        port = int(target_port)
-                        if parts[0] == "ASK":
-                            return self._once(host, port, arguments, asking=True)
-                raise CronlockError("too many Redis Cluster redirects")
-            except (OSError, TimeoutError, CronlockError) as exc:
-                last_error = exc
-                if isinstance(exc, RedisReplyError) or attempt == self.attempts:
-                    break
-                time.sleep(min(self.backoff * attempt, 5))
-        raise CronlockError(f"Redis command failed: {last_error}") from last_error
-
-
-class LeaseMonitor(threading.Thread):
-    """Renew the lease; VIP ownership gates startup, not active jobs."""
-
-    def __init__(self, settings: dict[str, str], key: str, token: str, lease: float):
-        super().__init__(daemon=True)
-        self.settings = settings
-        self.key = key
-        self.token = token
-        self.lease = lease
-        self.stop_requested = threading.Event()
-        self.lost_reason = ""
-
-    def run(self):
-        interval = min(1.0, max(0.2, self.lease / 3))
-        next_renewal = time.monotonic() + self.lease / 3
-        last_renewal = time.monotonic()
-        while not self.stop_requested.wait(interval):
-            try:
-                now = time.monotonic()
-                if now < next_renewal:
-                    continue
-                timeout = min(
-                    number(self.settings, "CRONLOCK_REDIS_TIMEOUT", 5, minimum=0.1),
-                    self.lease / 4,
-                )
-                # A renewal must have a bounded single attempt. Retrying inside
-                # the client can outlive the lease and delay fail-closed shutdown.
-                result = RedisClient(
-                    self.settings, timeout=timeout, attempts=0
-                ).execute(
-                    "EVAL",
-                    RENEW_SCRIPT,
-                    1,
-                    self.key,
-                    self.token,
-                    int(self.lease * 1000),
-                )
-                if result != 1:
-                    self.lost_reason = "Redis lease is no longer owned by this command"
-                    return
-                last_renewal = time.monotonic()
-                next_renewal = last_renewal + self.lease / 3
-            # An unexpected exception in this thread must not leave work running
-            # with an expired lease.
-            except Exception as exc:
-                verbose(self.settings, f"lease renewal delayed: {exc}")
-                if time.monotonic() >= last_renewal + self.lease * 0.5:
-                    self.lost_reason = "Redis lease could not be renewed safely"
-                    return
-                next_renewal = time.monotonic() + interval
-
-
-def stop_process_group(process: subprocess.Popen, grace: float) -> None:
-    # The direct child can exit before a detached grandchild does. Kill the
-    # whole process group, including those descendants, on a safety stop.
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    deadline = time.monotonic() + grace
-    while time.monotonic() < deadline:
-        process.poll()  # Reap the direct child so a lone zombie cannot hold the group ID.
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.05)
-    else:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    if process.poll() is None:
-        process.wait()
-
-
-def run_command(settings: dict[str, str], arguments: list[str]) -> int:
-    if not arguments:
-        raise CronlockError("usage: cronlock command [argument ...]")
-    if settings.get("CRONLOCK_RESET", "no") == "yes":
-        raise CronlockError(
-            "CRONLOCK_RESET is unsafe for live leases and is no longer supported"
-        )
-    if not local_vip_owner(settings):
-        verbose(settings, "local VIP is absent; skipping command")
-        return SKIPPED
-
-    key_name = (
-        settings.get("CRONLOCK_KEY")
-        or hashlib.md5(  # noqa: S324 - legacy key format
-            (" ".join(arguments) + "\n").encode()
-        ).hexdigest()
-    )
-    key = settings.get("CRONLOCK_PREFIX", "cronlock.") + key_name
-    lease = number(settings, "CRONLOCK_LEASE", 90, minimum=1)
-    shutdown_grace = min(5, lease / 4)
-    grace = number(settings, "CRONLOCK_GRACE", 40)
-    maximum_run = number(settings, "CRONLOCK_TIMEOUT", 0)
-    token = secrets.token_hex(24)
-    acquired = RedisClient(settings).execute(
-        "SET", key, token, "NX", "PX", int(lease * 1000)
-    )
-    if acquired is None:
-        # An old cronlock could leave a numeric timestamp without a Redis TTL.
-        # Preserve its original deadline, but prevent it from blocking forever.
-        migrated = RedisClient(settings).execute(
-            "EVAL", LEGACY_SCRIPT, 1, key, token, int(lease * 1000)
-        )
-        if migrated != 1:
-            verbose(settings, f"{key} is already held; skipping command")
-            return SKIPPED
-        acquired = "OK"
-    if acquired != "OK":
-        raise CronlockError("Redis returned an unexpected lease acquisition result")
-
-    started = time.monotonic()
-    monitor = LeaseMonitor(settings, key, token, lease)
-    process = None
-    exit_code = ERROR
-    stop_signal = threading.Event()
-    old_handlers = {}
-
-    def request_stop(_signum, _frame):
-        stop_signal.set()
-
-    try:
-        for signum in (signal.SIGTERM, signal.SIGINT):
-            old_handlers[signum] = signal.signal(signum, request_stop)
-        if not local_vip_owner(settings):
-            raise CronlockError("local VIP disappeared before command startup")
-        try:
-            process = subprocess.Popen(arguments, start_new_session=True)
-        except OSError as exc:
-            raise CronlockError(f"cannot start command: {exc}") from exc
-        monitor.start()
-        while process.poll() is None:
-            if monitor.lost_reason:
-                print(f"cronlock: {monitor.lost_reason}", file=sys.stderr)
-                stop_process_group(process, shutdown_grace)
-                exit_code = ERROR
-                break
-            if not monitor.is_alive() and not monitor.stop_requested.is_set():
-                print("cronlock: lease monitor stopped unexpectedly", file=sys.stderr)
-                stop_process_group(process, shutdown_grace)
-                exit_code = ERROR
-                break
-            if stop_signal.is_set():
-                stop_process_group(process, shutdown_grace)
-                exit_code = 128 + signal.SIGTERM
-                break
-            if maximum_run and time.monotonic() - started >= maximum_run:
-                print("cronlock: command timed out", file=sys.stderr)
-                stop_process_group(process, shutdown_grace)
-                exit_code = TIMED_OUT
-                break
-            time.sleep(0.1)
-        else:
-            result = process.returncode
-            exit_code = 128 - result if result < 0 else result
-            if monitor.lost_reason:
-                exit_code = ERROR
-    finally:
-        if process is not None and process.poll() is None:
-            stop_process_group(process, shutdown_grace)
-        monitor.stop_requested.set()
-        if monitor.is_alive():
-            monitor.join()
-        for signum, handler in old_handlers.items():
-            signal.signal(signum, handler)
-        remaining_grace = max(0, round((started + grace - time.monotonic()) * 1000))
-        try:
-            RedisClient(settings).execute(
-                "EVAL", FINISH_SCRIPT, 1, key, token, remaining_grace
-            )
-        except CronlockError as exc:
-            print(f"cronlock: could not release lease: {exc}", file=sys.stderr)
-            exit_code = ERROR
-    return exit_code
-
-
-def main() -> int:
-    try:
-        settings = load_settings()
-        return run_command(settings, sys.argv[1:])
-    except (CronlockError, ValueError) as exc:
-        print(f"cronlock: {exc}", file=sys.stderr)
-        return ERROR
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+now_ms=$(date +%s%3N)
+remaining_ms=$(( started_ms + grace_ms - now_ms ))
+(( remaining_ms > 0 )) || remaining_ms=0
+release_lease "$remaining_ms" || die 'Redis lease could not be released safely'
+exit "$command_status"

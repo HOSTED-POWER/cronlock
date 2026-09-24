@@ -6,11 +6,11 @@ default production Redis endpoint and isolate all keys with a random prefix.
 
 import concurrent.futures
 import os
+import shutil
 import signal
 import socket
 import socketserver
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -59,6 +59,10 @@ def redis_command(*parts):
 
 @unittest.skipUnless(TEST_PORT, "set CRONLOCK_TEST_PORT to an isolated Redis instance")
 class CronlockIntegrationTest(unittest.TestCase):
+    def test_runtime_entrypoint_is_bash(self):
+        with SCRIPT.open(encoding="utf-8") as source:
+            self.assertEqual(source.readline().strip(), "#!/usr/bin/env bash")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="cronlock-test-")
         self.addCleanup(self.temp.cleanup)
@@ -255,9 +259,9 @@ class CronlockIntegrationTest(unittest.TestCase):
         self.assertEqual(result.returncode, 200, result.stderr)
         self.assertEqual(result.stdout, "")
 
-    def test_missing_bash_for_config_fails_without_traceback(self):
+    def test_missing_redis_cli_fails_cleanly(self):
         result = subprocess.run(
-            [sys.executable, str(SCRIPT), "/bin/true"],
+            ["/bin/bash", str(SCRIPT), "/bin/true"],
             env=self.env | {"PATH": self.temp.name},
             capture_output=True,
             text=True,
@@ -265,8 +269,7 @@ class CronlockIntegrationTest(unittest.TestCase):
             check=False,
         )
         self.assertEqual(result.returncode, 201)
-        self.assertIn("cannot load config file", result.stderr)
-        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("redis-cli", result.stderr)
 
     def test_old_owner_cannot_release_a_successor_token(self):
         first = self.start_lock("/bin/sleep", "8")
@@ -316,9 +319,73 @@ class CronlockIntegrationTest(unittest.TestCase):
     def test_redis_unavailable_fails_closed(self):
         marker = Path(self.temp.name) / "must-not-run"
         env = self.env | {"CRONLOCK_PORT": "1"}
-        result = self.run_lock("/usr/bin/touch", str(marker), env=env)
+        result = self.run_lock("/bin/touch", str(marker), env=env)
         self.assertEqual(result.returncode, 201)
         self.assertFalse(marker.exists())
+
+    def test_redis_outage_during_job_stops_the_command(self):
+        fake_bin = Path(self.temp.name) / "bin"
+        fake_bin.mkdir()
+        outage = Path(self.temp.name) / "redis-down"
+        started = Path(self.temp.name) / "job-started"
+        fake_cli = fake_bin / "redis-cli"
+        fake_cli.write_text(
+            "#!/bin/sh\n"
+            f"test -e '{outage}' && exit 1\n"
+            f"exec '{shutil.which('redis-cli')}' \"$@\"\n"
+        )
+        fake_cli.chmod(0o755)
+        env = self.env | {"PATH": str(fake_bin) + os.pathsep + self.env.get("PATH", "")}
+        first = self.start_lock(
+            "/bin/sh", "-c", f"/bin/touch {started}; exec /bin/sleep 8", env=env
+        )
+        key = self.wait_for_key()
+        for _ in range(100):
+            if started.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("the command did not start")
+        outage.touch()
+        self.assertEqual(first.wait(timeout=5), 201, first.stderr.read())
+        self.assertLess(redis_command("PTTL", key), 2000)
+
+    def test_redis_acl_authentication(self):
+        username = "cronlock_" + uuid.uuid4().hex
+        password = uuid.uuid4().hex
+        self.assertEqual(
+            redis_command("ACL", "SETUSER", username, "on", f">{password}", "+@all", "~*"),
+            "OK",
+        )
+        try:
+            env = self.env | {"CRONLOCK_USER": username, "CRONLOCK_AUTH": password}
+            result = self.run_lock("/bin/echo", "authenticated", env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "authenticated")
+            bad = self.run_lock(
+                "/bin/echo", "must-not-run",
+                env=env | {"CRONLOCK_AUTH": "wrong", "CRONLOCK_KEY": uuid.uuid4().hex},
+            )
+            self.assertEqual(bad.returncode, 201)
+            self.assertEqual(bad.stdout, "")
+            missing_password = self.run_lock(
+                "/bin/echo", "must-not-run",
+                env=env | {"CRONLOCK_AUTH": "", "CRONLOCK_KEY": uuid.uuid4().hex},
+            )
+            self.assertEqual(missing_password.returncode, 201)
+            self.assertEqual(missing_password.stdout, "")
+        finally:
+            redis_command("ACL", "DELUSER", username)
+
+    def test_invalid_redis_database_cannot_fall_back_to_database_zero(self):
+        env = self.env | {"CRONLOCK_DB": "999"}
+        result = self.run_lock("/bin/echo", "must-not-run", env=env)
+        self.assertEqual(result.returncode, 201)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            redis_command("EXISTS", self.env["CRONLOCK_PREFIX"] + self.env["CRONLOCK_KEY"]),
+            0,
+        )
 
     def test_redis_cluster_moved_reply_is_followed(self):
         port = self.static_server(f"-MOVED 0 127.0.0.1:{TEST_PORT}\r\n".encode())
@@ -376,7 +443,7 @@ class CronlockIntegrationTest(unittest.TestCase):
         first = self.start_lock(
             "/bin/sh",
             "-c",
-            f"/usr/bin/touch {started}; exec /bin/sleep 6",
+            f"/bin/touch {started}; exec /bin/sleep 6",
             env=old_owner_env,
         )
         key = self.wait_for_key()

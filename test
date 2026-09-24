@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+bash -n cronlock
+
+# Keep the installed command dependency-free of Python. The Python test harness
+# can run beside a disposable Redis server when redis-cli is not on this host.
+if ! command -v redis-cli >/dev/null 2>&1; then
+  command -v docker >/dev/null 2>&1 || {
+    echo 'Install redis-cli or Docker to run the tests.' >&2
+    exit 1
+  }
+  docker run --rm -v "$PWD:/src:ro" -w /src redis:7-alpine sh -ec '
+    apk add --no-cache bash python3 coreutils util-linux iproute2 >/dev/null
+    redis-server --daemonize yes
+    CRONLOCK_TEST_HOST=127.0.0.1 CRONLOCK_TEST_PORT=6379 python3 -m unittest discover -s tests -v
+  '
+  exit
+fi
+
 cronlock_test_container=""
 if [[ -z "${CRONLOCK_TEST_PORT:-}" ]]; then
   if ! command -v docker >/dev/null 2>&1; then
@@ -19,5 +36,4 @@ if [[ -z "${CRONLOCK_TEST_PORT:-}" ]]; then
   done
 fi
 
-python3 -m py_compile cronlock
 python3 -m unittest discover -s tests -v

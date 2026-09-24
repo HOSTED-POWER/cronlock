@@ -1,27 +1,28 @@
 # cronlock
 
 Run one copy of a command at a time using a short, renewable Redis lease. This
-fork continues to accept `cronlock command [arguments...]` and the historical
-`CRONLOCK_*` configuration file. It replaces the original 2012 timestamp lock,
-which could suppress cron for `CRONLOCK_RELEASE` (48 hours in TurboStack) after
-the worker rebooted.
+fork remains a Bash command and continues to accept
+`cronlock command [arguments...]` and the historical `CRONLOCK_*` configuration
+file. It replaces the original 2012 timestamp lock, which could suppress cron
+for `CRONLOCK_RELEASE` (48 hours in TurboStack) after the worker rebooted.
 
 The original project is [kvz/cronlock](https://github.com/kvz/cronlock), by
 Kevin van Zonneveld and contributors. This fork remains MIT-licensed.
 
 ## Requirements
 
-- Python 3.9 or newer; no third-party Python packages or `redis-cli` are needed.
+- Bash, `redis-cli`, GNU coreutils (`timeout`, `md5sum`, `od`, `date`), and
+  `setsid` (util-linux). The installed command does not use Python.
 - A reachable Redis server. Redis Sentinel and Redis Cluster redirects are
   supported through the existing settings.
-- Bash only when loading an existing shell-style `cronlock.conf`. Treat that
-  file as trusted executable configuration and keep it writable only by an
-  administrator.
+- Treat the shell-style `cronlock.conf` as trusted executable configuration and
+  keep it writable only by an administrator. Redis replies are never evaluated
+  as shell code.
 - Linux `ip` (iproute2) only when `CRONLOCK_LOCAL_VIP` is set.
 
-Use a reviewed release of this fork for deployment. Do not fetch a floating
-`master` branch into production; that can replace a tested executable during
-an unrelated provisioning run.
+TurboStack installs the executable from this fork's `master` branch. Changes
+to that branch can therefore replace the executable on the next deployment;
+test changes before publishing them.
 
 ## Basic use
 
@@ -118,7 +119,7 @@ tool, assignments in a config file override same-named environment variables.
 | `CRONLOCK_GRACE` | Minimum interval since acquisition before next owner | `40` seconds |
 | `CRONLOCK_LOCAL_VIP` | Optional IP that must be local to run | unset |
 | `CRONLOCK_TIMEOUT` | Maximum command run time; `0` disables | `0` |
-| `CRONLOCK_REDIS_TIMEOUT` | Socket timeout seconds | `5` |
+| `CRONLOCK_REDIS_TIMEOUT` | Maximum time for one Redis CLI call, in seconds | `5` |
 | `CRONLOCK_RECONNECT_ATTEMPTS`, `CRONLOCK_RECONNECT_BACKOFF` | Redis retry count and step seconds | `5`, `1` |
 | `CRONLOCK_USE_SENTINEL`, `CRONLOCK_SENTINEL_MASTER`, `CRONLOCK_SENTINEL_HOST`, `CRONLOCK_SENTINEL_PORT` | Optional Sentinel lookup | `no`, `mymaster`, `localhost`, `26379` |
 | `CRONLOCK_SENTINEL_AUTH` | Optional Sentinel password | unset |
@@ -137,6 +138,7 @@ tool, child exit codes in the reserved 200–202 range are ambiguous.
 ## Testing
 
 `make test` or `./test` starts a disposable Redis 7 container when Docker is
-available. To use an existing disposable Redis instance, set
-`CRONLOCK_TEST_PORT` (and optionally `CRONLOCK_TEST_HOST`) first. Never point
-the tests at a production Redis instance.
+available. The test suite uses Python only as a test harness. To use an existing
+disposable Redis instance, set `CRONLOCK_TEST_PORT` (and optionally
+`CRONLOCK_TEST_HOST`) first. Never point the tests at a production Redis
+instance.
