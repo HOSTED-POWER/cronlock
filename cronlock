@@ -325,7 +325,7 @@ class RedisClient:
 
 
 class LeaseMonitor(threading.Thread):
-    """Renew the lease and watch VIP ownership while the command is alive."""
+    """Renew the lease; VIP ownership gates startup, not active jobs."""
 
     def __init__(self, settings: dict[str, str], key: str, token: str, lease: float):
         super().__init__(daemon=True)
@@ -342,9 +342,6 @@ class LeaseMonitor(threading.Thread):
         last_renewal = time.monotonic()
         while not self.stop_requested.wait(interval):
             try:
-                if not local_vip_owner(self.settings):
-                    self.lost_reason = "local VIP ownership was lost"
-                    return
                 now = time.monotonic()
                 if now < next_renewal:
                     continue

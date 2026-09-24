@@ -4,6 +4,7 @@ Set CRONLOCK_TEST_PORT to the published Redis test port. Tests never use the
 default production Redis endpoint and isolate all keys with a random prefix.
 """
 
+import concurrent.futures
 import os
 import signal
 import socket
@@ -140,15 +141,55 @@ class CronlockIntegrationTest(unittest.TestCase):
         self.assertNotIn("must-not-run", second.stdout)
         self.assertEqual(first.wait(timeout=6), 0, first.stderr.read())
 
+    def test_long_running_owner_blocks_many_contenders_across_renewals(self):
+        env = self.env | {"CRONLOCK_LEASE": "2"}
+        first = self.start_lock("/bin/sleep", "12", env=env)
+        key = self.wait_for_key()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            for _ in range(3):
+                time.sleep(2.1)
+                contenders = list(
+                    pool.map(
+                        lambda _: self.run_lock("/bin/echo", "must-not-run", env=env),
+                        range(8),
+                    )
+                )
+                self.assertTrue(all(item.returncode == 200 for item in contenders))
+                self.assertGreater(redis_command("PTTL", key), 0)
+        self.assertEqual(first.wait(timeout=8), 0, first.stderr.read())
+
     def test_crashed_owner_does_not_block_for_legacy_48_hours(self):
-        first = self.start_lock("/bin/sleep", "3")
-        self.wait_for_key()
-        first.kill()  # SIGKILL deliberately prevents graceful release.
-        first.wait(timeout=2)
-        time.sleep(2.5)
-        second = self.run_lock("/bin/echo", "recovered")
-        self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(second.stdout.strip(), "recovered")
+        marker = Path(self.temp.name) / "command.pid"
+        first = self.start_lock(
+            "/bin/sh", "-c", f"echo $$ > {marker}; exec /bin/sleep 15"
+        )
+        key = self.wait_for_key()
+        for _ in range(100):
+            if marker.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("the command did not start")
+        command_pid = int(marker.read_text())
+        command_running = True
+        try:
+            # A host crash stops both the wrapper and its command. Neither can
+            # release the Redis key, so recovery must depend on the short TTL.
+            first.kill()
+            os.killpg(command_pid, signal.SIGKILL)
+            command_running = False
+            first.wait(timeout=2)
+            self.assertGreater(redis_command("PTTL", key), 0)
+            time.sleep(2.5)
+            second = self.run_lock("/bin/echo", "recovered")
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(second.stdout.strip(), "recovered")
+        finally:
+            if command_running:
+                try:
+                    os.killpg(command_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_expired_legacy_timestamp_is_migrated_atomically(self):
         key = self.env["CRONLOCK_PREFIX"] + self.env["CRONLOCK_KEY"]
@@ -304,25 +345,59 @@ class CronlockIntegrationTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "sentinel-ok")
 
-    def test_vip_loss_stops_an_active_command(self):
+    def test_vip_loss_drains_active_command_and_blocks_new_owner(self):
         fake_bin = Path(self.temp.name) / "bin"
         fake_bin.mkdir()
         marker = Path(self.temp.name) / "owns-vip"
+        started = Path(self.temp.name) / "job-started"
         marker.touch()
         fake_ip = fake_bin / "ip"
         fake_ip.write_text(
             "#!/bin/sh\n"
             f"test -e '{marker}' && printf '5: eth3 inet 10.100.30.20/24 scope global\\n'\n"
+            "exit 0\n"
         )
         fake_ip.chmod(0o755)
-        env = self.env | {
+        old_owner_env = self.env | {
             "CRONLOCK_LOCAL_VIP": "10.100.30.20",
             "PATH": str(fake_bin) + os.pathsep + self.env.get("PATH", ""),
         }
-        first = self.start_lock("/bin/sleep", "8", env=env)
-        self.wait_for_key()
+        new_bin = Path(self.temp.name) / "new-bin"
+        new_bin.mkdir()
+        new_ip = new_bin / "ip"
+        new_ip.write_text(
+            "#!/bin/sh\nprintf '5: eth3 inet 10.100.30.20/24 scope global\\n'\n"
+        )
+        new_ip.chmod(0o755)
+        new_owner_env = self.env | {
+            "CRONLOCK_LOCAL_VIP": "10.100.30.20",
+            "PATH": str(new_bin) + os.pathsep + self.env.get("PATH", ""),
+        }
+        first = self.start_lock(
+            "/bin/sh",
+            "-c",
+            f"/usr/bin/touch {started}; exec /bin/sleep 6",
+            env=old_owner_env,
+        )
+        key = self.wait_for_key()
+        for _ in range(100):
+            if started.exists():
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("the first command did not start")
         marker.unlink()
-        self.assertEqual(first.wait(timeout=4), 201)
+        time.sleep(2.5)  # More than one lease: it must renew after losing the VIP.
+        self.assertGreater(redis_command("PTTL", key), 0)
+        self.assertIsNone(first.poll())
+        old_retry = self.run_lock("/bin/echo", "must-not-run", env=old_owner_env)
+        self.assertEqual(old_retry.returncode, 200, old_retry.stderr)
+        contender = self.run_lock("/bin/echo", "must-wait", env=new_owner_env)
+        self.assertEqual(contender.returncode, 200, contender.stderr)
+        self.assertEqual(first.wait(timeout=8), 0, first.stderr.read())
+        successor = self.run_lock("/bin/echo", "new-owner-ran", env=new_owner_env)
+        self.assertEqual(successor.returncode, 0, successor.stderr)
+        self.assertEqual(successor.stdout.strip(), "new-owner-ran")
 
 
 if __name__ == "__main__":

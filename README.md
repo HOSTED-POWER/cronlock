@@ -48,8 +48,8 @@ inspect its owner before any manual removal.
 Set `CRONLOCK_LOCAL_VIP` in `/etc/cronlock.conf` on both peers, or only for the
 specific cron entry. When it is unset, no VIP check takes place. When set, a
 non-owner skips before contacting Redis; the owner runs the job under the
-normal Redis lease. The VIP is rechecked while the command runs, and a loss of
-ownership terminates its process group.
+normal Redis lease. Cronlock checks the VIP again immediately before starting
+the command, but does not interrupt a running job when the VIP moves.
 
 ```sh
 # /etc/cronlock.conf on both members of one HASET cluster
@@ -62,11 +62,13 @@ CRONLOCK_LOCAL_VIP="10.100.30.20"
 * * * * * cronlock /usr/bin/php /var/www/prod/magento2/current/bin/magento cron:run >> /var/www/prod/magento2/shared/var/log/crontab.log 2>&1
 ```
 
-The VIP mode makes a Pacemaker-owned address choose the *starting node*. It is
-not a distributed Magento lock provider. Detached application workers may
-outlive the parent command or leave its process group, so a planned VIP handoff
-still needs an application drain. If the VIP is absent everywhere, no node
-starts new work. Monitor both the scheduler and the application's job backlog.
+The VIP mode makes a Pacemaker-owned address choose the *starting node*. An
+existing job can finish on the former owner while renewing its Redis lease;
+the new owner skips that job until the lease is released. It is not a
+distributed Magento lock provider. A planned reboot still needs an application
+drain: rebooting a node kills its running jobs, and detached application work
+may outlive the parent command. If the VIP is absent everywhere, no node starts
+new work. Monitor both the scheduler and the application's job backlog.
 
 Do not set a global `CRONLOCK_LOCAL_VIP` on a host that also has unrelated
 cronlock jobs unless those jobs should follow the same VIP. Per-job settings
@@ -90,11 +92,16 @@ it run indefinitely without a lock. `CRONLOCK_RELEASE` is deprecated and is
 release timer is not a safe replacement for renewal: a long-running job could
 then overlap its successor.
 
-These are cooperative leases, not a promise of exactly-once execution. Redis
-asynchronous failover can lose a recently written key; a process killed with
-`SIGKILL` can leave its child running briefly; and a program may create
-detached work outside the managed process group. Duplicate-sensitive jobs
-still need application-level idempotency or stronger fencing/coordination.
+These are cooperative leases, not a promise of exactly-once execution. A
+whole-host reboot stops both cronlock and its command; the unrenewed lease
+then expires on its own. If only cronlock is killed with `SIGKILL`, Linux may
+leave its command running after the lease expires, allowing overlap. To stop a
+job deliberately, use a normal termination signal or stop its entire process
+group. Redis failover or a restart that loses the lease key can likewise allow
+brief overlap before the old owner detects the lost lease and stops. Cronlock
+releases the lock when the direct command exits; background work that outlives
+it is not covered. Duplicate-sensitive jobs still need application-level
+locking or idempotency.
 
 ## Configuration
 
